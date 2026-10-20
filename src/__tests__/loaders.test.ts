@@ -348,6 +348,139 @@ describe('loaders: SourcifyABILoader v2', () => {
   });
 });
 
+describe('loaders: EtherscanV2ABILoader rate limits', () => {
+  const address = "0x0000000000000000000000000000000000000001";
+  const abi = [{ type: "function", name: "deposit", inputs: [] }];
+
+  // Records requested delays instead of sleeping.
+  function recordWaits() {
+    const waits: number[] = [];
+    return { waits, wait: async (ms: number) => { waits.push(ms); } };
+  }
+
+  function jsonResponse(body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  function successBody(method: 'getContract' | 'loadABI') {
+    if (method === "loadABI") {
+      return { status: "1", message: "OK", result: JSON.stringify(abi) };
+    }
+    return {
+      status: "1",
+      message: "OK",
+      result: [{
+        ABI: JSON.stringify(abi),
+        ContractName: "Token",
+        SourceCode: "contract Token {}",
+        CompilerVersion: "0.8.0",
+        EVMVersion: "london",
+        Runs: "200",
+      }],
+    };
+  }
+
+  test.each(['getContract', 'loadABI'] as const)(
+    '%s retries an Etherscan rate-limit response',
+    async (method) => {
+      const { waits, wait } = recordWaits();
+      const rateLimited = {
+        status: "0",
+        message: "NOTOK",
+        result: "Max rate limit reached, please use API Key for higher rate limit",
+      };
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse(rateLimited))
+        .mockResolvedValueOnce(jsonResponse(successBody(method)));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const loader = new EtherscanV2ABILoader({ apiKey: "test", retry: { wait } });
+      const result = await loader[method](address);
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(waits).toEqual([1000]);
+      if (method === "loadABI") {
+        expect(result).toEqual(abi);
+      } else {
+        expect(result).toMatchObject({ abi, name: "Token", ok: true });
+      }
+    },
+  );
+
+  test.each(['getContract', 'loadABI'] as const)(
+    '%s does not retry an unverified contract',
+    async (method) => {
+      const fetchMock = vi.fn(async () => jsonResponse({
+        status: "0",
+        message: "NOTOK",
+        result: "Contract source code not verified",
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const loader = new EtherscanV2ABILoader({ apiKey: "test" });
+      const result = await loader[method](address);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      if (method === "loadABI") {
+        expect(result).toEqual([]);
+      } else {
+        expect(result).toMatchObject({ ok: false, abi: [] });
+      }
+    },
+  );
+
+  test.each(['getContract', 'loadABI'] as const)(
+    '%s gives up after repeated Etherscan rate limits',
+    async (method) => {
+      const { waits, wait } = recordWaits();
+      const fetchMock = vi.fn(async () => jsonResponse({
+        status: "0",
+        message: "NOTOK",
+        result: "Max rate limit reached",
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const loader = new EtherscanV2ABILoader({ apiKey: "test", retry: { wait } });
+      const error = await loader[method](address).then(
+        () => { throw new Error(`expected ${method} to reject`); },
+        (error) => error,
+      );
+
+      expect(error.message).toContain("Max rate limit reached");
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(waits).toEqual([1000, 2000, 3000]);
+    },
+  );
+
+  test.each([
+    ["rate limit", { status: "0", result: "Max calls per sec rate limit reached (5/sec)" }, 2000],
+    ["unverified", { status: "0", result: "Contract source code not verified" }, undefined],
+    ["daily limit", { status: "0", result: "Max daily limit reached" }, undefined],
+    ["success", { status: "1", result: "[]" }, undefined],
+    ["non-string result", { status: "0", result: [] }, undefined],
+  ])('retryDelay: %s', (_, body, expected) => {
+    expect(EtherscanV2ABILoader.retryDelay(body, 2)).toBe(expected);
+  });
+
+  test('getContract does not retry when the ABI field says the source is unverified', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({
+      status: "1",
+      message: "OK",
+      result: [{ ABI: "Contract source code not verified" }],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const loader = new EtherscanV2ABILoader({ apiKey: "test" });
+    const result = await loader.getContract(address);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ ok: false, abi: [] });
+  });
+});
+
 describe('loaders: BlockscoutABILoader', () => {
   test.each([
     ["JSON", JSON.stringify({ message: "Not found" }), "application/json"],
@@ -485,13 +618,16 @@ describe('loaders: BlockscoutABILoader', () => {
         ));
       vi.stubGlobal("fetch", fetchMock);
 
+      const waits: number[] = [];
       const loader = new BlockscoutABILoader({
         baseURL: "https://eth.blockscout.test/api",
+        retry: { wait: async (ms) => { waits.push(ms); } },
       });
       const address = "0x0000000000000000000000000000000000000001";
 
       await expect(loader[method](address)).resolves.toBeDefined();
       expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(waits).toEqual([0]);
     },
   );
 });

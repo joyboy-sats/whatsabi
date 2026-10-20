@@ -45,12 +45,63 @@ export class FetchError extends Error {
   }
 }
 
-export async function fetchJSON(url: string): Promise<any> {
-  const response = await fetch(url, {
+/**
+ * Retry behaviour shared by loaders that talk to rate-limited APIs.
+ * `wait` defaults to setTimeout; pass your own to control the pacing
+ * (tests resolve it immediately so they never sleep).
+ */
+export type RetryConfig = {
+  retries?: number;
+  wait?: (ms: number) => Promise<void>;
+};
+
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/**
+ * Call fn until retryDelay returns undefined (accept the result) or retries
+ * run out, waiting retryDelay(result, attempt) ms between calls. Callers
+ * decide what counts as retryable, so service quirks stay in their loaders.
+ */
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  retryDelay: (result: T, attempt: number) => number | undefined,
+  { retries = 3, wait = sleep }: RetryConfig = {},
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    const result = await fn();
+    const ms = attempt <= retries ? retryDelay(result, attempt) : undefined;
+    if (ms === undefined) return result;
+    await wait(ms);
+  }
+}
+
+const MAX_RETRY_AFTER_SECONDS = 10;
+
+/**
+ * HTTP 429: honor Retry-After when it is a small delay (0-10s), otherwise
+ * wait attempt seconds (1s, 2s, 3s). A missing header is not 0:
+ * Number(null) === 0, which would retry immediately.
+ */
+export function retryDelay429(response: Response, attempt: number): number | undefined {
+  if (response.status !== 429) return undefined;
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter != null && retryAfter.trim() !== "") {
+    const seconds = Number(retryAfter);
+    if (seconds >= 0 && seconds <= MAX_RETRY_AFTER_SECONDS) return seconds * 1000;
+  }
+  return attempt * 1000;
+}
+
+export function fetchWithRetry(url: string, init?: RequestInit, retry?: RetryConfig): Promise<Response> {
+  return withRetry(() => fetch(url, init), retryDelay429, retry);
+}
+
+export async function fetchJSON(url: string, retry?: RetryConfig): Promise<any> {
+  const response = await fetchWithRetry(url, {
     headers: {
       "Content-Type": "application/json",
     },
-  });
+  }, retry);
   if (!response.ok) {
     throw new FetchError(response.statusText, response.status);
   }

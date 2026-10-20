@@ -24,8 +24,11 @@
  * ]);
  * ```
  */
-import { fetchJSON } from "./utils.js";
+import { fetchJSON, fetchWithRetry, withRetry } from "./utils.js";
+import type { RetryConfig } from "./utils.js";
 import * as errors from "./errors.js";
+
+export type { RetryConfig };
 
 export type ContractResult = {
     abi: any[];
@@ -196,10 +199,26 @@ export class EtherscanV2ABILoader implements ABILoader {
     readonly name: string = "EtherscanV2ABILoader";
     apiKey?: string;
     baseURL: string;
+    retry?: RetryConfig;
 
-    constructor(config: { apiKey: string, chainId?: number }) {
+    constructor(config: { apiKey: string, chainId?: number, retry?: RetryConfig }) {
         this.apiKey = config.apiKey;
         this.baseURL = `https://api.etherscan.io/v2/api?chainid=${config?.chainId ?? 1}`;
+        this.retry = config.retry;
+    }
+
+    /**
+     * Etherscan signals throttling as HTTP 200 + status "0" with a result
+     * like "Max rate limit reached", which the HTTP 429 retry does not see.
+     * Misses such as "Contract source code not verified" are not retried.
+     */
+    static retryDelay(body: any, attempt: number): number | undefined {
+        if (body?.status === "0" && /rate limit/i.test(body?.result)) return attempt * 1000;
+        return undefined;
+    }
+
+    #fetchJSON(url: URL): Promise<any> {
+        return withRetry(() => fetchJSON(url.toString(), this.retry), EtherscanV2ABILoader.retryDelay, this.retry);
     }
 
     /** Etherscan helper for converting the encoded SourceCode result arg to a decoded ContractSources. */
@@ -234,7 +253,7 @@ export class EtherscanV2ABILoader implements ABILoader {
         Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
 
         try {
-            const r = await fetchJSON(url.toString());
+            const r = await this.#fetchJSON(url);
             if (r.status === "0") {
                 if (r.result === "Contract source code not verified") return emptyContractResult;
                 throw new Error(r.result);    // This gets wrapped below
@@ -289,7 +308,7 @@ export class EtherscanV2ABILoader implements ABILoader {
         Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
 
         try {
-            const r = await fetchJSON(url.toString());
+            const r = await this.#fetchJSON(url);
 
             if (r.status === "0") {
                 if (r.result === "Contract source code not verified") return [];
@@ -467,10 +486,12 @@ export class BlockscoutABILoader implements ABILoader {
 
     apiKey?: string;
     baseURL: string;
+    retry?: RetryConfig;
 
-    constructor(config?: { apiKey?: string; baseURL?: string; chainId?: number }) {
+    constructor(config?: { apiKey?: string; baseURL?: string; chainId?: number; retry?: RetryConfig }) {
         if (config === undefined) config = {};
         this.apiKey = config.apiKey;
+        this.retry = config.retry;
         // A chainId routes through the multichain gateway, which requires an
         // apiKey (or an x402 payment); the server enforces this. Some
         // "featured" chains (e.g. Base) also require a paid plan and respond
@@ -511,15 +532,8 @@ export class BlockscoutABILoader implements ABILoader {
         if (this.apiKey) url += "?apikey=" + this.apiKey;
 
         try {
-            let response = await fetch(url);
-            // The gateway rate-limits per key; back off and retry a few times
-            // before giving up, respecting a sane Retry-After when present.
-            for (let attempt = 1; response.status === 429 && attempt <= 3; attempt++) {
-                const retryAfter = Number(response.headers.get("retry-after"));
-                const seconds = (retryAfter >= 0 && retryAfter <= 10) ? retryAfter : attempt;
-                await new Promise(resolve => setTimeout(resolve, seconds * 1000));
-                response = await fetch(url);
-            }
+            // The gateway rate-limits per key; fetchWithRetry backs off on 429.
+            const response = await fetchWithRetry(url, undefined, this.retry);
             if (response.status === 404) return emptyContractResult;
 
             const responseText = await response.text();
